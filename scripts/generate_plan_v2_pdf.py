@@ -250,16 +250,22 @@ def build():
 
     story += [SP(6), H2('3.3  附加实验：Spatial Alignment 对比')]
     story += [P('任务书要求量化 spatial alignment（滑窗推理时重叠区域一致性处理）对分割精度的影响：')]
+
+    def pc(text, fs=8.5):
+        return Paragraph(text, ParagraphStyle('cell', fontName=F, fontSize=fs,
+                                              leading=fs * 1.5, wordWrap='CJK',
+                                              alignment=TA_LEFT))
+
     align_data = [
         ['条件', '处理方式', '预期效果'],
-        ['条件 A（有 alignment）',
-         '对重叠区域（相邻块的共有点）的预测 logits 取多次预测的加权平均，再输出最终标签',
-         '边界处预测更一致，mIoU 更高，但推理时间略长'],
-        ['条件 B（无 alignment）',
-         '每个块独立推理，重叠区域随机保留最后一个块的预测结果，不做融合',
-         '推理速度快，但边界点类别可能不一致'],
+        [pc('条件 A（有 alignment）'),
+         pc('对重叠区域（相邻块的共有点）的预测 logits 取多次预测的加权平均，再输出最终标签'),
+         pc('边界处预测更一致，mIoU 更高，但推理时间略长')],
+        [pc('条件 B（无 alignment）'),
+         pc('每个块独立推理，重叠区域随机保留最后一个块的预测结果，不做融合'),
+         pc('推理速度快，但边界点类别可能不一致')],
     ]
-    story += [tbl(align_data, [4.0*cm, 6.5*cm, 5.0*cm], fontsize=8.5)]
+    story += [tbl(align_data, [4.0*cm, 7.0*cm, 4.5*cm], fontsize=8.5)]
     story += [SP(4), P('评估指标：mIoU 差值、边界点专项 IoU（距离相邻块边界 < 0.5m 的点）、推理时间差值。')]
 
     # ══════════════════════════════════════════════════════════════════════

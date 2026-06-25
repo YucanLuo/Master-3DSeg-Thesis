@@ -35,3 +35,7 @@ Thumbs.db
 # Editor
 .vscode/
 *.swp
+
+# Claude Code / tooling (local config, credentials)
+.claude/
+.vscode-cli/

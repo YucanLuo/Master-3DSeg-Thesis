@@ -1,0 +1,117 @@
+环境与配置基线 - 避坑指南
+（2026-06-24 整理，源于Pilot A训练异常慢+测试反复OOM的排查）
+
+背景：这次排查花了一整个会话才查清楚，根因是数据集被悄悄换成了未压缩的原始版本
+（点数暴涨~20倍），叠加test.py一处未提交的并发改动，导致训练慢13倍、测试反复OOM。
+本文档把"正确状态"列出来，以后开新实验前先按下面的清单自查，不要重蹈覆辙。
+
+一、数据集 —— 最容易踩的坑
+
+1. data/s3dis 这个符号链接必须指向体积化之后的版本，不能指向原始版本：
+   正确: Pointcept/data/s3dis -> /workspace/data/s3dis_vox
+   错误: Pointcept/data/s3dis -> /workspace/data/s3dis_raw （或直接是raw数据本身）
+
+   检查命令：
+     readlink -f /workspace/Pointcept/data/s3dis
+     python3 -c "import numpy as np; print(np.load('/workspace/Pointcept/data/s3dis/Area_5/office_13/coord.npy', mmap_mode='r').shape[0])"
+   正确结果应该是 46666（office_13这个房间体积化后的点数，逐次运行应该完全一致，
+   因为GridSample用的是确定性哈希）。如果看到几十万到上百万的数字，说明又指错了。
+
+2. 三份数据的存放位置（都在持久化的/workspace下，不在会丢的/tmp下）：
+   /workspace/data/s3dis_raw   原始数据，每个房间70万~400万点，不要直接拿来训练/测试
+   /workspace/data/s3dis_vox   体积化后的数据(grid_size=0.05m)，每个房间约2万~17万点，
+                                这才是应该被data/s3dis指向的版本
+   /workspace/data/s3dis.tar.gz  原始压缩包，留着以防需要重新解压
+
+3. 如果s3dis_vox不存在或者怀疑数据不对，重新生成的脚本：
+     PYTHONPATH=./ /workspace/miniconda3/envs/thesis/bin/python \
+       scripts/prevoxelize_persistent.py
+   （读 s3dis_raw，写到 s3dis_vox，全量272个房间大概100~150秒跑完）
+   千万不要把输出写到/tmp下面的路径——容器重启/回收后/tmp会清空，
+   这正是这次问题的起点（最早的体积化脚本输出写到了/tmp/s3dis_vox，后来丢了）。
+
+4. 为什么要体积化：训练用的增强pipeline（RandomRotate/RandomJitter/ElasticDistortion等）
+   是在GridSample体积化*之前*对点云做的，如果输入是原始百万级点云，这些增强步骤的
+   计算量会跟着暴涨，哪怕最终SphereCrop会限制到point_max=100000个点喂进网络。
+   测试阶段更严重：全场景推理没有裁剪上限，叠加10倍TTA增强，大房间可能直接把容器
+   50GB内存上限打爆（OOM kill）。
+
+二、代码状态 —— 开实验前务必检查git diff
+
+1. 核心引擎文件不应该有意外的本地改动，跑实验前先看一眼：
+     cd /workspace/Pointcept && git diff pointcept/engines/test.py pointcept/engines/train.py
+   正常情况下这两个文件应该和git HEAD完全一致（git diff无输出）。
+
+   关键设置（如果diff有内容，对照检查是不是被改坏了）：
+   - pointcept/engines/test.py 的 build_test_loader():
+       num_workers=self.cfg.batch_size_test_per_gpu   (= 1, 单进程预取，安全)
+       pin_memory=True
+     不要改成 min(4, num_worker_per_gpu) 之类的——这次OOM的次因就是这处被改动，
+     导致测试阶段4个worker并发预取大房间，叠加数据问题直接打爆内存。
+
+   - pointcept/engines/train.py 的两处 build_train_loader():
+       persistent_workers=True
+     如果是False，会导致每个epoch开头都要重新拉起num_worker个worker进程，
+     正常情况下这个开销在干净的小数据集上不明显（~6秒/epoch），
+     但叠加其他问题会放大成几十秒到一分多钟/epoch的卡顿。
+
+2. 以下几个本地修改是*预期内*的，是Pilot B（按box输入策略）需要的新功能，不是bug：
+   - configs/_base_/default_runtime.py: num_worker默认值16->48（不影响各实验，
+     因为每个实验config都会自己显式设置num_worker覆盖掉这个默认值）
+   - pointcept/datasets/s3dis.py: 新增 S3DISBoxDataset 类
+   - pointcept/datasets/transform.py: 新增 GridBoxCrop 变换
+   这三个保持现状即可，不要revert。
+
+三、运行环境
+
+1. Python解释器必须用thesis这个conda环境，不要用系统python：
+     /workspace/miniconda3/envs/thesis/bin/python
+   （系统python没装torch/spconv/pointops/addict等依赖，会直接ModuleNotFoundError）
+
+2. pointcept没有pip安装，必须从Pointcept目录下运行并设置PYTHONPATH：
+     cd /workspace/Pointcept
+     PYTHONPATH=./ /workspace/miniconda3/envs/thesis/bin/python tools/train.py ...
+
+3. wandb默认是开启的（configs/_base_/default_runtime.py: enable_wandb=True），
+   这个环境没配置wandb API key，跑训练/测试时记得在--options里加 enable_wandb=False，
+   否则会在Building Trainer那一步直接报错退出：
+     wandb.errors.errors.UsageError: No API key configured.
+
+四、资源约束
+
+1. 容器内存cgroup硬上限约50GB（不是宿主机的503GB，是这个容器自己的限制）：
+     cat /sys/fs/cgroup/memory.max   # 49999998976 字节 ≈ 46.6GiB
+   监控当前用量和是否发生过OOM kill：
+     cat /sys/fs/cgroup/memory.current
+     cat /sys/fs/cgroup/memory.events   # 看 oom_kill 这一行的计数有没有增加
+
+2. 单GPU（1x NVIDIA RTX A6000，46GB显存），nvidia-smi查看占用：
+     nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+
+3. 在数据已经体积化(s3dis_vox)的前提下，num_worker=16训练、num_worker=1测试
+   都是安全的，这正是SpUNet baseline当年用的设置，全程无OOM、500 epoch只要2小时8分。
+
+五、开新实验前的检查清单（建议每次都过一遍）
+
+  [ ] readlink -f data/s3dis  ->  确认指向 /workspace/data/s3dis_vox
+  [ ] 抽查一个房间点数（如office_13应为46666）确认数据没被换回原始版本
+  [ ] git status --short  ->  确认 engines/test.py 和 engines/train.py 没有意外diff
+  [ ] cat /sys/fs/cgroup/memory.max  ->  确认还是约50GB，心里有这个上限的概念
+  [ ] nvidia-smi  ->  确认GPU空闲，没有别的进程占着
+  [ ] 训练/测试命令里加 enable_wandb=False（除非真的配置了wandb）
+  [ ] 用 /workspace/miniconda3/envs/thesis/bin/python，PYTHONPATH=./，cwd在Pointcept目录下
+
+六、本次问题的简要时间线（供以后排查类似问题参考）
+
+  2026-06-09 19:13  S3DIS原始数据解压到 /workspace/data/s3dis（百万级点/房间）
+  2026-06-10 00:41  有人写了prevoxelize.py把数据压缩到~3万点/房间，
+                     但输出写到了/tmp/s3dis_vox（临时盘，不持久化）
+  2026-06-10 00:43  SpUNet baseline用压缩版数据训练，全程正常（15秒/epoch，无OOM）
+  2026-06-11 17:45  data/s3dis符号链接被改回指向/workspace/data/s3dis（原始大数据），
+                     具体谁改的/为什么改的已不可考
+  2026-06-11 17:59  PTv3 baseline开始训练，从此之后一直在用错误的大数据
+                     （这个baseline的结果也受影响，待用户决定是否需要重跑）
+  2026-06-11之后    某次容器回收，/tmp/s3dis_vox彻底丢失，连恢复的可能都没有了
+  2026-06-23~24     Pilot A训练+测试，复现了同样的慢+OOM问题，本文档由此次排查产生
+  2026-06-24        重新体积化并固化到持久化路径/workspace/data/s3dis_vox，
+                     验证点数与baseline当年完全一致；Pilot A重新训练
